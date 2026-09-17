@@ -90,16 +90,31 @@ func (smsc *Smsc) removeSession(sessionId int) {
 	delete(smsc.Sessions, sessionId)
 }
 
-// findSession returns a copy of the session bound to the given system_id.
+// findSession returns a copy of a session bound to the given system_id, preferring one that can
+// carry MO messages.
+//
+// A transmitter and a receiver normally bind with the same system_id, and Go randomizes map
+// iteration order, so returning the first match refused a correctly bound client roughly half the
+// time: the transmitter came out of the map first and MO delivery gave up on it. A client with no
+// MO-capable bind at all is still refused, which is the honest answer.
 func (smsc *Smsc) findSession(systemId string) (Session, bool) {
 	smsc.mu.RLock()
 	defer smsc.mu.RUnlock()
+	var fallback Session
+	found := false
 	for _, sess := range smsc.Sessions {
-		if systemId == sess.SystemId {
+		if systemId != sess.SystemId {
+			continue
+		}
+		if sess.ReceiveMo {
 			return sess, true
 		}
+		if !found {
+			fallback = sess
+			found = true
+		}
 	}
-	return Session{}, false
+	return fallback, found
 }
 
 func (smsc *Smsc) Start(port int, wg *sync.WaitGroup) {

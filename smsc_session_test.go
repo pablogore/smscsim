@@ -58,3 +58,42 @@ func TestFindSessionReturnsTheBoundSession(t *testing.T) {
 		t.Errorf("expected no session for an unbound system_id")
 	}
 }
+
+// A transmitter and a receiver normally share one system_id. Map iteration order is randomized, so
+// this runs enough times to make a first-match implementation lose.
+func TestFindSessionPrefersAnMoCapableBind(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	for i := 0; i < 200; i++ {
+		smsc := NewSmsc(false)
+		smsc.addSession(1, Session{"smppclient", server, false}) // transmitter
+		smsc.addSession(2, Session{"smppclient", server, true})  // receiver
+
+		sess, found := smsc.findSession("smppclient")
+		if !found {
+			t.Fatalf("expected to find a session for system_id [smppclient]")
+		}
+		if !sess.ReceiveMo {
+			t.Fatalf("attempt %d picked the transmitter; MO delivery would have been refused", i)
+		}
+	}
+}
+
+func TestFindSessionStillReturnsATransmitterWhenNothingCanCarryMo(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	smsc := NewSmsc(false)
+	smsc.addSession(1, Session{"smppclient", server, false})
+
+	sess, found := smsc.findSession("smppclient")
+	if !found {
+		t.Fatalf("expected to find the transmitter session")
+	}
+	if sess.ReceiveMo {
+		t.Errorf("expected the transmitter, so SendMoMessage can refuse it explicitly")
+	}
+}
