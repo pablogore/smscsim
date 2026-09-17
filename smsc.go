@@ -106,16 +106,31 @@ func (smsc *Smsc) BoundSystemIds() []string {
 	return systemIds
 }
 
-func (smsc *Smsc) SendMoMessage(sender, recipient, message, systemId string) error {
-	var session *Session = nil
+// prefers a session that can receive MO messages. a client commonly binds twice under one
+// system_id, and only the receiver half declared itself able to carry MO. the fallback keeps
+// the refusal accurate when nothing bound under the system_id can receive
+func (smsc *Smsc) findMoSession(systemId string) (Session, bool) {
+	var fallback Session
+	found := false
 	for _, sess := range smsc.Sessions {
-		if systemId == sess.SystemId {
-			session = &sess
-			break
+		if sess.SystemId != systemId {
+			continue
+		}
+		if sess.ReceiveMo {
+			return sess, true
+		}
+		if !found {
+			fallback = sess
+			found = true
 		}
 	}
+	return fallback, found
+}
 
-	if session == nil {
+func (smsc *Smsc) SendMoMessage(sender, recipient, message, systemId string) error {
+	session, found := smsc.findMoSession(systemId)
+
+	if !found {
 		log.Printf("Cannot send MO message to systemId: [%s]. No bound session found", systemId)
 		return fmt.Errorf("No session found for systemId: [%s]", systemId)
 	}
