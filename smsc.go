@@ -68,13 +68,38 @@ type Tlv struct {
 }
 
 type Smsc struct {
+	mu            sync.RWMutex // guards Sessions
 	Sessions      map[int]Session
 	FailedSubmits bool
 }
 
-func NewSmsc(failedSubmits bool) Smsc {
+func NewSmsc(failedSubmits bool) *Smsc {
 	sessions := make(map[int]Session)
-	return Smsc{sessions, failedSubmits}
+	return &Smsc{Sessions: sessions, FailedSubmits: failedSubmits}
+}
+
+func (smsc *Smsc) addSession(sessionId int, session Session) {
+	smsc.mu.Lock()
+	defer smsc.mu.Unlock()
+	smsc.Sessions[sessionId] = session
+}
+
+func (smsc *Smsc) removeSession(sessionId int) {
+	smsc.mu.Lock()
+	defer smsc.mu.Unlock()
+	delete(smsc.Sessions, sessionId)
+}
+
+// findSession returns a copy of the session bound to the given system_id.
+func (smsc *Smsc) findSession(systemId string) (Session, bool) {
+	smsc.mu.RLock()
+	defer smsc.mu.RUnlock()
+	for _, sess := range smsc.Sessions {
+		if systemId == sess.SystemId {
+			return sess, true
+		}
+	}
+	return Session{}, false
 }
 
 func (smsc *Smsc) Start(port int, wg *sync.WaitGroup) {
@@ -98,6 +123,8 @@ func (smsc *Smsc) Start(port int, wg *sync.WaitGroup) {
 }
 
 func (smsc *Smsc) BoundSystemIds() []string {
+	smsc.mu.RLock()
+	defer smsc.mu.RUnlock()
 	var systemIds []string
 	for _, sess := range smsc.Sessions {
 		systemId := sess.SystemId
@@ -107,15 +134,9 @@ func (smsc *Smsc) BoundSystemIds() []string {
 }
 
 func (smsc *Smsc) SendMoMessage(sender, recipient, message, systemId string) error {
-	var session *Session = nil
-	for _, sess := range smsc.Sessions {
-		if systemId == sess.SystemId {
-			session = &sess
-			break
-		}
-	}
+	session, found := smsc.findSession(systemId)
 
-	if session == nil {
+	if !found {
 		log.Printf("Cannot send MO message to systemId: [%s]. No bound session found", systemId)
 		return fmt.Errorf("No session found for systemId: [%s]", systemId)
 	}
@@ -150,7 +171,7 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 	bound := false
 	receiver := false
 
-	defer delete(smsc.Sessions, sessionId)
+	defer smsc.removeSession(sessionId)
 	defer conn.Close()
 
 	for {
@@ -192,7 +213,7 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 					log.Printf("[%s] already has bound session", systemId)
 				} else {
 					receiveMo := cmdId == BIND_RECEIVER || cmdId == BIND_TRANSCEIVER
-					smsc.Sessions[sessionId] = Session{systemId, conn, receiveMo}
+					smsc.addSession(sessionId, Session{systemId, conn, receiveMo})
 					respBytes = stringBodyPDU(respCmdId, STS_OK, seqNum, "smscsim")
 					bound = true
 					receiver = cmdId == BIND_RECEIVER
