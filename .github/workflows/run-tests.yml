@@ -19,4 +19,5 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Run Golang tests
-        run: go test
+        # -race: the session store is reached from every connection goroutine and the web handler's
+        run: go test -race -count=1
