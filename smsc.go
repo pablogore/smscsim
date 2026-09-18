@@ -73,15 +73,27 @@ type Smsc struct {
 	sessions      map[int]Session
 	FailedSubmits bool
 	events        *Publisher
+	logs          *Subscription
 }
 
 func NewSmsc(failedSubmits bool) *Smsc {
 	sessions := make(map[int]Session)
 	smsc := &Smsc{sessions: sessions, FailedSubmits: failedSubmits, events: NewPublisher()}
 	// writing the log is a subscriber like any other. the simulator says what happened once, and
-	// the log is simply the listener that has always been there
-	smsc.Subscribe(logEvent)
+	// the log is simply the listener that has always been there.
+	//
+	// the handle is kept rather than thrown away: it carries the queue this subscriber fell behind
+	// on, and the subscriber reads it back so a loss is announced in the log instead of vanishing
+	logger := &logSubscriber{}
+	smsc.logs = smsc.Subscribe(logger.handle)
+	logger.bind(smsc.logs)
 	return smsc
+}
+
+// LogSubscription is the handle on the simulator's own logging subscriber. It is exposed so a
+// consumer can read Dropped() and see how much of the log it should not trust.
+func (smsc *Smsc) LogSubscription() *Subscription {
+	return smsc.logs
 }
 
 // Subscribe registers fn to receive every event the simulator publishes at the PDU boundary. It is
