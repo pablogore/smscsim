@@ -1,4 +1,4 @@
-FROM golang:1.13.15-alpine AS build
+FROM golang:1.27.1-alpine AS build
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ RUN apk upgrade --update \
 
 ##########################################
 
-FROM alpine:3.12.1
+FROM alpine:3.24.2
 
 COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
 
