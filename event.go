@@ -41,6 +41,14 @@ const (
 	KindUnsupportedPdu        EventKind = "unsupported_pdu"
 	KindProtocolError         EventKind = "protocol_error"
 	KindConnectionClosed      EventKind = "connection_closed"
+
+	// MO delivery, which the simulator is asked for from outside the SMPP connection rather than by
+	// a client PDU. The refusals are kept apart from each other because a consumer acts differently
+	// on "nobody is bound" than on "the bound client cannot take MO messages".
+	KindMoMessage           EventKind = "mo_message"
+	KindMoNoSession         EventKind = "mo_no_session"
+	KindMoBindCannotReceive EventKind = "mo_bind_cannot_receive"
+	KindMoSendFailed        EventKind = "mo_send_failed"
 )
 
 // Event is one thing the simulator observed at the PDU boundary. Every field is a small value, so

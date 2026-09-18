@@ -57,6 +57,11 @@ const (
 )
 
 type Session struct {
+	// Id is the key this session is filed under in the store. It is stamped by addSession rather
+	// than by the caller, so the session and the map can never name it differently: a caller that
+	// supplies one is simply overruled. Knowing its own key is what lets a session be named in an
+	// event by something that only holds the session, such as MO delivery.
+	Id        int
 	SystemId  string
 	Conn      net.Conn
 	ReceiveMo bool
@@ -112,6 +117,9 @@ func (smsc *Smsc) publish(e Event) {
 }
 
 func (smsc *Smsc) addSession(sessionId int, session Session) {
+	// the store is the single writer of Id, so the key and the session always agree
+	session.Id = sessionId
+
 	smsc.mu.Lock()
 	defer smsc.mu.Unlock()
 	smsc.sessions[sessionId] = session
@@ -194,13 +202,27 @@ func (smsc *Smsc) BoundSystemIds() []string {
 func (smsc *Smsc) SendMoMessage(sender, recipient, message, systemId string) error {
 	session, found := smsc.findSession(systemId)
 
+	// MO delivery says what it did the same way the read loop does. the format strings and their
+	// arguments are untouched, so the sentence a subscriber writes to the log is the sentence this
+	// function used to write itself. the session names itself: when nothing was found there is no
+	// session to name and Id is zero, which is the honest answer
+	emit := func(kind EventKind, direction Direction, format string, args ...any) {
+		smsc.publish(Event{
+			Kind:      kind,
+			Direction: direction,
+			SystemId:  systemId,
+			SessionId: session.Id,
+			Text:      fmt.Sprintf(format, args...),
+		})
+	}
+
 	if !found {
-		log.Printf("Cannot send MO message to systemId: [%s]. No bound session found", systemId)
+		emit(KindMoNoSession, Inbound, "Cannot send MO message to systemId: [%s]. No bound session found", systemId)
 		return fmt.Errorf("No session found for systemId: [%s]", systemId)
 	}
 
 	if !session.ReceiveMo {
-		log.Printf("Cannot send MO message to systemId: [%s]. Only RECEIVER and TRANSCEIVER sessions could receive MO messages", systemId)
+		emit(KindMoBindCannotReceive, Inbound, "Cannot send MO message to systemId: [%s]. Only RECEIVER and TRANSCEIVER sessions could receive MO messages", systemId)
 		return fmt.Errorf("Only RECEIVER and TRANSCEIVER sessions could receive MO messages")
 	}
 
@@ -213,11 +235,11 @@ func (smsc *Smsc) SendMoMessage(sender, recipient, message, systemId string) err
 	for i := range udhParts {
 		pdu := deliverSmPDU(sender, recipient, udhParts[i], CODING_UCS2, rand.Int(), esmClass, tlvs)
 		if _, err := session.Conn.Write(pdu); err != nil {
-			log.Printf("Cannot send MO message to systemId: [%s]. Network error [%v]", systemId, err)
+			emit(KindMoSendFailed, Outbound, "Cannot send MO message to systemId: [%s]. Network error [%v]", systemId, err)
 			return fmt.Errorf("Cannot send MO message. Network error")
 		}
 	}
-	log.Printf("MO message to systemId: [%s] was successfully sent. Sender: [%s], recipient: [%s]", systemId, sender, recipient)
+	emit(KindMoMessage, Outbound, "MO message to systemId: [%s] was successfully sent. Sender: [%s], recipient: [%s]", systemId, sender, recipient)
 	return nil
 }
 
@@ -285,7 +307,7 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 					emit(KindBindRejected, Outbound, "[%s] already has bound session", systemId)
 				} else {
 					receiveMo := cmdId == BIND_RECEIVER || cmdId == BIND_TRANSCEIVER
-					smsc.addSession(sessionId, Session{systemId, conn, receiveMo})
+					smsc.addSession(sessionId, Session{SystemId: systemId, Conn: conn, ReceiveMo: receiveMo})
 					respBytes = stringBodyPDU(respCmdId, STS_OK, seqNum, "smscsim")
 					bound = true
 					receiver = cmdId == BIND_RECEIVER
