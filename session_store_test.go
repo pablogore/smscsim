@@ -349,3 +349,50 @@ func submitSmPDU(seqNum uint32, srcAddr, destAddr, message string, registeredDel
 
 	return pdu.Bytes()
 }
+
+// UNBIND drops the store entry while the connection stays open, so the bind that follows on
+// that same connection must put it back. this walks the whole lifecycle, including an MO
+// message, to prove the unbind fix cannot leave a validly rebound session invisible
+func TestRebindOnTheSameConnectionIsVisibleAgain(t *testing.T) {
+	smsc := NewSmsc(false)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("cannot listen: %v", err)
+	}
+	defer listener.Close()
+
+	go smsc.serve(listener)
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("cannot dial: %v", err)
+	}
+	defer conn.Close()
+
+	writePDU(t, conn, stringBodyPDU(BIND_TRANSCEIVER, STS_OK, 1, "first"))
+	readPDU(t, conn)
+	if !awaitBound(smsc, "first", true) {
+		t.Fatalf("expected [first] to be bound, store reports %v", smsc.BoundSystemIds())
+	}
+
+	writePDU(t, conn, headerPDU(UNBIND, STS_OK, 2))
+	readPDU(t, conn)
+	if !awaitBound(smsc, "first", false) {
+		t.Fatalf("expected [first] to be gone after unbind, store reports %v", smsc.BoundSystemIds())
+	}
+
+	writePDU(t, conn, stringBodyPDU(BIND_TRANSCEIVER, STS_OK, 3, "second"))
+	readPDU(t, conn)
+	if !awaitBound(smsc, "second", true) {
+		t.Fatalf("rebind on the same connection must be visible again, store reports %v", smsc.BoundSystemIds())
+	}
+
+	// the store entry is only worth something if it still routes an MO message to this connection
+	if err := smsc.SendMoMessage("77012110000", "1001", "Test", "second"); err != nil {
+		t.Fatalf("MO message to the rebound session was refused: %v", err)
+	}
+	if !awaitDeliverSm(t, conn) {
+		t.Errorf("expected the MO message on the rebound connection")
+	}
+}
