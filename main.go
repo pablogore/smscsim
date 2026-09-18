@@ -55,6 +55,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		serve(cfg)
 		return 0
+	case "tui":
+		cfg, err := parseTuiConfig(commandArgs, stderr)
+		if errors.Is(err, flag.ErrHelp) {
+			printUsage(stdout)
+			return 0
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return exitUsage
+		}
+		return runTui(cfg, stderr, launchTuiProgram)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n\n", command)
 		printUsage(stderr)
@@ -168,11 +179,17 @@ Usage:
 Commands:
   serve   start the simulator (SMPP and web servers). This is the default
           command when none is given.
+  tui     start the simulator with a terminal interface (SMPP server only, no
+          web server).
   help    show this help
 
 Flags for serve:
   --smpp-port int        port the SMPP server listens on (env SMSC_PORT, default 2775)
   --web-port int         port the web server listens on (env WEB_PORT, default 12775)
+  --failed-submits       make submit_sm requests fail (env FAILED_SUBMITS, default false)
+
+Flags for tui:
+  --smpp-port int        port the SMPP server listens on (env SMSC_PORT, default 2775)
   --failed-submits       make submit_sm requests fail (env FAILED_SUBMITS, default false)
 
 A flag always takes precedence over its environment variable, which takes

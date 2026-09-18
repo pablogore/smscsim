@@ -28,6 +28,7 @@ Running the binary with no arguments starts the simulator, exactly as before.
 ```
 ./smscsim              # same as ./smscsim serve
 ./smscsim serve        # start the smpp and web servers
+./smscsim tui          # start the smpp server with a terminal interface
 ./smscsim help         # show the available commands (also -h / --help)
 ```
 
@@ -37,6 +38,38 @@ Running the binary with no arguments starts the simulator, exactly as before.
 ```
 ./smscsim serve --smpp-port 2776 --web-port 12776 --failed-submits
 ```
+
+### Terminal interface
+
+`tui` starts the same smpp server inside a terminal interface, so sessions,
+protocol activity and MO messages are handled without a browser. It does not
+start the web server, so it has no `--web-port` flag:
+
+```
+./smscsim tui --smpp-port 2776 --failed-submits
+```
+
+Its flags follow the same precedence as the ones of `serve`
+(flag > env variable > default):
+
+* `--smpp-port` - port the smpp server listens on (env `SMSC_PORT`, default 2775)
+* `--failed-submits` - make submit_sm requests fail (env `FAILED_SUBMITS`, default false)
+
+The screen is split into three panes:
+
+* **SESSIONS** - the bound smpp sessions, with their system id, bind type,
+  remote address and bind time. The cursor selects the session an MO message is
+  sent to.
+* **EVENTS** - the protocol activity of the simulator as it happens: binds,
+  unbinds, received and sent PDUs, and errors. The standard log is muted while
+  the interface is running so it cannot overwrite the screen, and the oldest
+  entries are dropped once the log is full.
+* **MO MESSAGE** - sender, recipient and message text of a mobile originated
+  message, delivered to the selected session with a _deliver_sm_ PDU.
+
+`tab` and `shift+tab` move between the panes, `enter` sends the MO message from
+the form, and `q` or `ctrl+c` quits. If the smpp port is already taken, the
+command reports it and exits before the interface starts.
 
 ### Features
 
