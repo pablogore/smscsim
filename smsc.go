@@ -72,11 +72,31 @@ type Smsc struct {
 	mu            sync.RWMutex // guards sessions
 	sessions      map[int]Session
 	FailedSubmits bool
+	events        *Publisher
 }
 
 func NewSmsc(failedSubmits bool) *Smsc {
 	sessions := make(map[int]Session)
-	return &Smsc{sessions: sessions, FailedSubmits: failedSubmits}
+	smsc := &Smsc{sessions: sessions, FailedSubmits: failedSubmits, events: NewPublisher()}
+	// writing the log is a subscriber like any other. the simulator says what happened once, and
+	// the log is simply the listener that has always been there
+	smsc.Subscribe(logEvent)
+	return smsc
+}
+
+// Subscribe registers fn to receive every event the simulator publishes at the PDU boundary. It is
+// a method rather than a constructor argument so NewSmsc keeps the signature its callers already
+// use, and so a consumer can come and go while the simulator runs.
+func (smsc *Smsc) Subscribe(fn func(Event)) *Subscription {
+	return smsc.events.Subscribe(fn)
+}
+
+// publish stamps the event with the moment it happened and hands it to the subscribers.
+func (smsc *Smsc) publish(e Event) {
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	smsc.events.Publish(e)
 }
 
 func (smsc *Smsc) addSession(sessionId int, session Session) {
@@ -200,11 +220,25 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 	defer smsc.removeSession(sessionId)
 	defer conn.Close()
 
+	// every sentence this loop used to hand straight to log.Printf is now an event. the text is
+	// built the same way, so the log a subscriber writes is unchanged, and the kind, direction and
+	// session identity are there for a consumer that wants the fact rather than the sentence.
+	// only this goroutine reads systemId, which it rewrites on every bind and unbind
+	emit := func(kind EventKind, direction Direction, format string, args ...any) {
+		smsc.publish(Event{
+			Kind:      kind,
+			Direction: direction,
+			SystemId:  systemId,
+			SessionId: sessionId,
+			Text:      fmt.Sprintf(format, args...),
+		})
+	}
+
 	for {
 		// read PDU header
 		pduHeadBuf := make([]byte, 16)
 		if _, err := io.ReadFull(conn, pduHeadBuf); err != nil {
-			log.Printf("closing connection for system_id[%s] due %v\n", systemId, err)
+			emit(KindConnectionClosed, Inbound, "closing connection for system_id[%s] due %v\n", systemId, err)
 			return
 		}
 		cmdLen := binary.BigEndian.Uint32(pduHeadBuf[0:])
@@ -219,24 +253,24 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 			{
 				pduBody := make([]byte, cmdLen-16)
 				if _, err := io.ReadFull(conn, pduBody); err != nil {
-					log.Printf("closing connection due %v\n", err)
+					emit(KindConnectionClosed, Inbound, "closing connection due %v\n", err)
 					return
 				}
 
 				// find first null terminator
 				idx := bytes.IndexByte(pduBody, byte(0))
 				if idx == -1 {
-					log.Printf("invalid pdu_body. cannot find system_id. closing connection")
+					emit(KindProtocolError, Inbound, "invalid pdu_body. cannot find system_id. closing connection")
 					return
 				}
 				systemId = string(pduBody[:idx])
-				log.Printf("bind request from system_id[%s]\n", systemId)
+				emit(KindBindRequest, Inbound, "bind request from system_id[%s]\n", systemId)
 
 				respCmdId := 2147483648 + cmdId // hack to calc resp cmd id
 
 				if bound {
 					respBytes = headerPDU(respCmdId, STS_ALREADY_BOUND, seqNum)
-					log.Printf("[%s] already has bound session", systemId)
+					emit(KindBindRejected, Outbound, "[%s] already has bound session", systemId)
 				} else {
 					receiveMo := cmdId == BIND_RECEIVER || cmdId == BIND_TRANSCEIVER
 					smsc.addSession(sessionId, Session{systemId, conn, receiveMo})
@@ -247,7 +281,7 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 			}
 		case UNBIND: // unbind request
 			{
-				log.Printf("unbind request from system_id[%s]\n", systemId)
+				emit(KindUnbindRequest, Inbound, "unbind request from system_id[%s]\n", systemId)
 				respBytes = headerPDU(UNBIND_RESP, STS_OK, seqNum)
 				// upstream deliberately keeps the tcp connection open after unbind, and that
 				// stays. only the store entry goes, so the system_id stops being advertised as
@@ -258,21 +292,21 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 			}
 		case ENQUIRE_LINK: // enquire_link
 			{
-				log.Printf("enquire_link from system_id[%s]\n", systemId)
+				emit(KindEnquireLink, Inbound, "enquire_link from system_id[%s]\n", systemId)
 				respBytes = headerPDU(ENQUIRE_LINK_RESP, STS_OK, seqNum)
 			}
 		case SUBMIT_SM: // submit_sm
 			{
 				pduBody := make([]byte, cmdLen-16)
 				if _, err := io.ReadFull(conn, pduBody); err != nil {
-					log.Printf("error reading submit_sm body for %s due %v. closing connection", systemId, err)
+					emit(KindConnectionClosed, Inbound, "error reading submit_sm body for %s due %v. closing connection", systemId, err)
 					return
 				}
-				log.Printf("submit_sm from system_id[%s]\n", systemId)
+				emit(KindSubmitSm, Inbound, "submit_sm from system_id[%s]\n", systemId)
 
 				if receiver {
 					respBytes = headerPDU(SUBMIT_SM_RESP, STS_INV_BIND_STS, seqNum)
-					log.Printf("error handling submit_sm from system_id[%s]. session with bind type RECEIVER cannot send requests", systemId)
+					emit(KindSubmitRejected, Outbound, "error handling submit_sm from system_id[%s]. session with bind type RECEIVER cannot send requests", systemId)
 					break
 				}
 
@@ -331,17 +365,33 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 					respBytes = stringBodyPDU(SUBMIT_SM_RESP, STS_OK, seqNum, msgId)
 					// send DLR if necessary
 					if registeredDlr != 0 {
-						// the read loop rewrites systemId on every later bind and unbind
+						// the read loop rewrites systemId on every later bind and unbind, so the
+						// receipt carries the system_id that submitted it, not whichever one is
+						// bound two seconds later. that is also why this goroutine builds its own
+						// events instead of using emit, which reads the live variable
 						dlrSystemId := systemId
+						dlrSessionId := sessionId
 						go func() {
 							time.Sleep(2000 * time.Millisecond)
 							now := time.Now()
 							dlr := deliveryReceiptPDU(destAddr, srcAddr, msgId, now, now, smsc.FailedSubmits)
 							if _, err := conn.Write(dlr); err != nil {
-								log.Printf("error sending delivery receipt to system_id[%s] due %v.", dlrSystemId, err)
+								smsc.publish(Event{
+									Kind:      KindDeliveryReceiptFailed,
+									Direction: Outbound,
+									SystemId:  dlrSystemId,
+									SessionId: dlrSessionId,
+									Text:      fmt.Sprintf("error sending delivery receipt to system_id[%s] due %v.", dlrSystemId, err),
+								})
 								return
 							} else {
-								log.Printf("delivery receipt for message [%s] was send to system_id[%s]", msgId, dlrSystemId)
+								smsc.publish(Event{
+									Kind:      KindDeliveryReceipt,
+									Direction: Outbound,
+									SystemId:  dlrSystemId,
+									SessionId: dlrSessionId,
+									Text:      fmt.Sprintf("delivery receipt for message [%s] was send to system_id[%s]", msgId, dlrSystemId),
+								})
 							}
 						}()
 					}
@@ -352,29 +402,29 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 				if cmdLen > 16 {
 					buf := make([]byte, cmdLen-16)
 					if _, err := io.ReadFull(conn, buf); err != nil {
-						log.Printf("error reading deliver_sm_resp for %s due %v. closing connection", systemId, err)
+						emit(KindConnectionClosed, Inbound, "error reading deliver_sm_resp for %s due %v. closing connection", systemId, err)
 						return
 					}
 				}
-				log.Println("deliver_sm_resp from", systemId)
+				emit(KindDeliverSmResp, Inbound, "deliver_sm_resp from %s", systemId)
 			}
 		default:
 			{
 				if cmdLen > 16 {
 					buf := make([]byte, cmdLen-16)
 					if _, err := io.ReadFull(conn, buf); err != nil {
-						log.Printf("error reading pdu for %s due %v. closing connection", systemId, err)
+						emit(KindConnectionClosed, Inbound, "error reading pdu for %s due %v. closing connection", systemId, err)
 						return
 					}
 				}
-				log.Printf("unsupported pdu cmd_id(%d) from %s", cmdId, systemId)
+				emit(KindUnsupportedPdu, Inbound, "unsupported pdu cmd_id(%d) from %s", cmdId, systemId)
 				// generic nack packet with status "Invalid Command ID"
 				respBytes = headerPDU(GENERIC_NACK, STS_INVALID_CMD, seqNum)
 			}
 		}
 
 		if _, err := conn.Write(respBytes); err != nil {
-			log.Printf("error sending response to system_id[%s] due %v. closing connection", systemId, err)
+			emit(KindConnectionClosed, Outbound, "error sending response to system_id[%s] due %v. closing connection", systemId, err)
 			return
 		}
 	}
