@@ -7,7 +7,7 @@ import (
 )
 
 // Regression test for the "concurrent map writes" crash: two smpp clients
-// binding at the same time used to write smsc.Sessions without any lock.
+// binding at the same time used to write the session map without any lock.
 func TestConcurrentSessionAccessIsRaceFree(t *testing.T) {
 	smsc := NewSmsc(false)
 

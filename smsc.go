@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -68,26 +69,26 @@ type Tlv struct {
 }
 
 type Smsc struct {
-	mu            sync.RWMutex // guards Sessions
-	Sessions      map[int]Session
+	mu            sync.RWMutex // guards sessions
+	sessions      map[int]Session
 	FailedSubmits bool
 }
 
 func NewSmsc(failedSubmits bool) *Smsc {
 	sessions := make(map[int]Session)
-	return &Smsc{Sessions: sessions, FailedSubmits: failedSubmits}
+	return &Smsc{sessions: sessions, FailedSubmits: failedSubmits}
 }
 
 func (smsc *Smsc) addSession(sessionId int, session Session) {
 	smsc.mu.Lock()
 	defer smsc.mu.Unlock()
-	smsc.Sessions[sessionId] = session
+	smsc.sessions[sessionId] = session
 }
 
 func (smsc *Smsc) removeSession(sessionId int) {
 	smsc.mu.Lock()
 	defer smsc.mu.Unlock()
-	delete(smsc.Sessions, sessionId)
+	delete(smsc.sessions, sessionId)
 }
 
 // findSession returns a copy of a session bound to the given system_id, preferring one that can
@@ -102,7 +103,7 @@ func (smsc *Smsc) findSession(systemId string) (Session, bool) {
 	defer smsc.mu.RUnlock()
 	var fallback Session
 	found := false
-	for _, sess := range smsc.Sessions {
+	for _, sess := range smsc.sessions {
 		if systemId != sess.SystemId {
 			continue
 		}
@@ -127,13 +128,23 @@ func (smsc *Smsc) Start(port int, wg *sync.WaitGroup) {
 	defer ln.Close()
 
 	log.Println("SMSC simulator listening on port", port)
+	smsc.serve(ln)
+}
+
+// split out of Start so the tests can drive the server on an ephemeral port. a temporary
+// accept error is logged and retried as before, a closed listener ends the loop
+func (smsc *Smsc) serve(ln net.Listener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("error accepting new tcp connection %v", err)
-		} else {
-			go handleSmppConnection(smsc, conn)
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Temporary() {
+				log.Printf("error accepting new tcp connection %v", err)
+				continue
+			}
+			return
 		}
+		go handleSmppConnection(smsc, conn)
 	}
 }
 
@@ -141,7 +152,7 @@ func (smsc *Smsc) BoundSystemIds() []string {
 	smsc.mu.RLock()
 	defer smsc.mu.RUnlock()
 	var systemIds []string
-	for _, sess := range smsc.Sessions {
+	for _, sess := range smsc.sessions {
 		systemId := sess.SystemId
 		systemIds = append(systemIds, systemId)
 	}
@@ -238,6 +249,10 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 			{
 				log.Printf("unbind request from system_id[%s]\n", systemId)
 				respBytes = headerPDU(UNBIND_RESP, STS_OK, seqNum)
+				// upstream deliberately keeps the tcp connection open after unbind, and that
+				// stays. only the store entry goes, so the system_id stops being advertised as
+				// bound and stops being selected for MO messages
+				smsc.removeSession(sessionId)
 				bound = false
 				systemId = "anonymous"
 			}
@@ -316,15 +331,17 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 					respBytes = stringBodyPDU(SUBMIT_SM_RESP, STS_OK, seqNum, msgId)
 					// send DLR if necessary
 					if registeredDlr != 0 {
+						// the read loop rewrites systemId on every later bind and unbind
+						dlrSystemId := systemId
 						go func() {
 							time.Sleep(2000 * time.Millisecond)
 							now := time.Now()
 							dlr := deliveryReceiptPDU(destAddr, srcAddr, msgId, now, now, smsc.FailedSubmits)
 							if _, err := conn.Write(dlr); err != nil {
-								log.Printf("error sending delivery receipt to system_id[%s] due %v.", systemId, err)
+								log.Printf("error sending delivery receipt to system_id[%s] due %v.", dlrSystemId, err)
 								return
 							} else {
-								log.Printf("delivery receipt for message [%s] was send to system_id[%s]", msgId, systemId)
+								log.Printf("delivery receipt for message [%s] was send to system_id[%s]", msgId, dlrSystemId)
 							}
 						}()
 					}
