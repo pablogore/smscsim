@@ -23,7 +23,7 @@ func TestConcurrentSessionAccessIsRaceFree(t *testing.T) {
 		sessionId := i
 		go func() {
 			defer wg.Done()
-			smsc.addSession(sessionId, Session{"system_id", server, true})
+			smsc.addSession(sessionId, Session{SystemId: "system_id", Conn: server, ReceiveMo: true})
 		}()
 		go func() {
 			defer wg.Done()
@@ -44,7 +44,7 @@ func TestFindSessionReturnsTheBoundSession(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	smsc.addSession(1, Session{"transceiver", server, true})
+	smsc.addSession(1, Session{SystemId: "transceiver", Conn: server, ReceiveMo: true})
 
 	sess, found := smsc.findSession("transceiver")
 	if !found {
@@ -68,8 +68,8 @@ func TestFindSessionPrefersAnMoCapableBind(t *testing.T) {
 
 	for i := 0; i < 200; i++ {
 		smsc := NewSmsc(false)
-		smsc.addSession(1, Session{"smppclient", server, false}) // transmitter
-		smsc.addSession(2, Session{"smppclient", server, true})  // receiver
+		smsc.addSession(1, Session{SystemId: "smppclient", Conn: server, ReceiveMo: false}) // transmitter
+		smsc.addSession(2, Session{SystemId: "smppclient", Conn: server, ReceiveMo: true})  // receiver
 
 		sess, found := smsc.findSession("smppclient")
 		if !found {
@@ -87,7 +87,7 @@ func TestFindSessionStillReturnsATransmitterWhenNothingCanCarryMo(t *testing.T) 
 	defer server.Close()
 
 	smsc := NewSmsc(false)
-	smsc.addSession(1, Session{"smppclient", server, false})
+	smsc.addSession(1, Session{SystemId: "smppclient", Conn: server, ReceiveMo: false})
 
 	sess, found := smsc.findSession("smppclient")
 	if !found {

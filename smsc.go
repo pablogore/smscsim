@@ -60,6 +60,11 @@ type Session struct {
 	SystemId  string
 	Conn      net.Conn
 	ReceiveMo bool
+	// metadata a view needs. ReceiveMo keeps its exact meaning, BindType records which bind
+	// request actually created the session
+	BindType   BindType
+	BoundAt    time.Time
+	RemoteAddr string
 }
 
 type Tlv struct {
@@ -69,8 +74,12 @@ type Tlv struct {
 }
 
 type Smsc struct {
-	mu            sync.RWMutex // guards sessions
-	sessions      map[int]Session
+	mu       sync.RWMutex // guards sessions
+	sessions map[int]Session
+	// the sink has its own lock on purpose: reusing mu would put the session map on the hot
+	// path of every emitted PDU
+	sinkMu        sync.RWMutex
+	sink          EventSink
 	FailedSubmits bool
 }
 
@@ -184,6 +193,7 @@ func (smsc *Smsc) SendMoMessage(sender, recipient, message, systemId string) err
 			log.Printf("Cannot send MO message to systemId: [%s]. Network error [%v]", systemId, err)
 			return fmt.Errorf("Cannot send MO message. Network error")
 		}
+		smsc.emitPduEvent(EventOutboundPdu, systemId, pdu, "MO message sent")
 	}
 	log.Printf("MO message to systemId: [%s] was successfully sent. Sender: [%s], recipient: [%s]", systemId, sender, recipient)
 	return nil
@@ -191,9 +201,17 @@ func (smsc *Smsc) SendMoMessage(sender, recipient, message, systemId string) err
 
 // how to convert ints to and from bytes https://golang.org/pkg/encoding/binary/
 
-func handleSmppConnection(smsc *Smsc, conn net.Conn) {
+func handleSmppConnection(smsc *Smsc, rawConn net.Conn) {
+	// every write to this connection goes through one serialized wrapper, including the ones
+	// issued by the delivery receipt goroutine and by SendMoMessage through Session.Conn
+	conn := newSyncConn(rawConn)
+
 	sessionId := rand.Int()
 	systemId := "anonymous"
+	remoteAddr := ""
+	if addr := rawConn.RemoteAddr(); addr != nil {
+		remoteAddr = addr.String()
+	}
 	bound := false
 	receiver := false
 
@@ -211,6 +229,8 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 		cmdId := binary.BigEndian.Uint32(pduHeadBuf[4:])
 		// cmdSts := binary.BigEndian.Uint32(pduHeadBuf[8:])
 		seqNum := binary.BigEndian.Uint32(pduHeadBuf[12:])
+
+		smsc.emitPduEvent(EventInboundPdu, systemId, pduHeadBuf, "pdu received")
 
 		var respBytes []byte
 
@@ -239,10 +259,27 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 					log.Printf("[%s] already has bound session", systemId)
 				} else {
 					receiveMo := cmdId == BIND_RECEIVER || cmdId == BIND_TRANSCEIVER
-					smsc.addSession(sessionId, Session{systemId, conn, receiveMo})
+					bindType := bindTypeForCommandId(cmdId)
+					boundAt := time.Now()
+					smsc.addSession(sessionId, Session{
+						SystemId:   systemId,
+						Conn:       conn,
+						ReceiveMo:  receiveMo,
+						BindType:   bindType,
+						BoundAt:    boundAt,
+						RemoteAddr: remoteAddr,
+					})
 					respBytes = stringBodyPDU(respCmdId, STS_OK, seqNum, "smscsim")
 					bound = true
 					receiver = cmdId == BIND_RECEIVER
+					smsc.emitEvent(Event{
+						At:          boundAt,
+						Kind:        EventBind,
+						SystemId:    systemId,
+						CommandId:   cmdId,
+						SequenceNum: seqNum,
+						Detail:      string(bindType) + " bound from " + remoteAddr,
+					})
 				}
 			}
 		case UNBIND: // unbind request
@@ -254,6 +291,14 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 				// bound and stops being selected for MO messages
 				smsc.removeSession(sessionId)
 				bound = false
+				smsc.emitEvent(Event{
+					At:          time.Now(),
+					Kind:        EventUnbind,
+					SystemId:    systemId,
+					CommandId:   cmdId,
+					SequenceNum: seqNum,
+					Detail:      "session unbound",
+				})
 				systemId = "anonymous"
 			}
 		case ENQUIRE_LINK: // enquire_link
@@ -341,6 +386,7 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 								log.Printf("error sending delivery receipt to system_id[%s] due %v.", dlrSystemId, err)
 								return
 							} else {
+								smsc.emitPduEvent(EventOutboundPdu, dlrSystemId, dlr, "delivery receipt sent")
 								log.Printf("delivery receipt for message [%s] was send to system_id[%s]", msgId, dlrSystemId)
 							}
 						}()
@@ -377,6 +423,7 @@ func handleSmppConnection(smsc *Smsc, conn net.Conn) {
 			log.Printf("error sending response to system_id[%s] due %v. closing connection", systemId, err)
 			return
 		}
+		smsc.emitPduEvent(EventOutboundPdu, systemId, respBytes, "response sent")
 	}
 }
 
