@@ -21,6 +21,23 @@ go build
 
 then, just configure your smpp client to connect to `localhost:2775`
 
+### Commands
+
+Running the binary with no arguments starts the simulator, exactly as before.
+
+```
+./smscsim              # same as ./smscsim serve
+./smscsim serve        # start the smpp and web servers
+./smscsim help         # show the available commands (also -h / --help)
+```
+
+`serve` accepts flags that override the environment variables
+(flag > env variable > default):
+
+```
+./smscsim serve --smpp-port 2776 --web-port 12776 --failed-submits
+```
+
 ### Features
 
 #### Delivery reports (DLR)
