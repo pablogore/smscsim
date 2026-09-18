@@ -95,9 +95,16 @@ func NewSmsc(failedSubmits bool) *Smsc {
 	return smsc
 }
 
-// LogSubscription is the handle on the simulator's own logging subscriber. It is exposed so a
-// consumer can read Dropped() and see how much of the log it should not trust.
-func (smsc *Smsc) LogSubscription() *Subscription {
+// DropCounter reports how many events a subscriber had to shed.
+type DropCounter interface {
+	Dropped() uint64
+}
+
+// LogSubscription is the handle on the simulator's own logging subscriber, narrowed to the one
+// thing a consumer has any business doing with it: reading how much of the log it should not
+// trust. Returning the live *Subscription would let a caller Unsubscribe the simulator's own
+// logger and silence it by accident.
+func (smsc *Smsc) LogSubscription() DropCounter {
 	return smsc.logs
 }
 
